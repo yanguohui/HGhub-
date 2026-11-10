@@ -1,0 +1,168 @@
+name: Sync Fork
+
+# 让你的 fork 自动跟随上游 Minireel/HGhub，并在上游发新版时自动触发 macOS 打包。
+#
+# 放置位置：<你的账号>/HGhub/.github/workflows/sync-fork.yml
+# 触发方式：定时（默认每 6 小时）+ Actions 页面手动 Run workflow
+#
+# 两个细节：
+#   1. 默认 hybrid 策略 = git merge，保留你自己加的 workflow 与本地改动；
+#      选 hard = git reset --hard，完全等于上游，会删掉 fork 里的自定义文件（谨慎）。
+#   2. 用 GITHUB_TOKEN 推送不会触发其它 workflow（GitHub 防循环），
+#      所以这里显式 gh workflow run 触发打包，而不是指望 push 事件。
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # UTC，每 6 小时一次（本地时间 +8，即 08:23 / 14:23 / 20:23 / 02:23）
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: '同步策略'
+        type: choice
+        options: [merge, hard]
+        default: merge
+      build_when:
+        description: '何时触发打包'
+        type: choice
+        options: [version, any, never]
+        default: version
+
+permissions:
+  contents: write   # 推送到 fork 的 main
+  actions: write    # 触发 build-macos-dmg.yml
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Minireel/HGhub
+  # 打包工作流文件名（默认用本套件里的 build-macos-dmg.yml）
+  BUILD_WORKFLOW: build-macos-dmg.yml
+  BUILD_ARCH: universal
+
+jobs:
+  sync:
+    name: 同步上游
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出（需要完整历史用于合并判断）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.repository.default_branch }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "$BRANCH"
+          echo "upstream_sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          echo "before_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "before_version=$(git show HEAD:src-tauri/tauri.conf.json | jq -r .version)" >> "$GITHUB_OUTPUT"
+
+      - name: 判断是否落后于上游
+        id: drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "behind=no" >> "$GITHUB_OUTPUT"
+            echo "已与上游 ${UPSTREAM} 同步，无需操作。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "behind=yes" >> "$GITHUB_OUTPUT"
+            echo "检测到上游新提交：" >> "$GITHUB_STEP_SUMMARY"
+            git --no-pager log --oneline -8 HEAD..FETCH_HEAD >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+
+      - name: 同步（merge 保留本地改动 / hard 完全对齐上游）
+        id: merge
+        if: steps.drift.outputs.behind == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.strategy || 'merge' }}"
+          if [[ "$MODE" == "hard" ]]; then
+            echo "::warning::使用 hard 策略：本地改动（含自定义 workflow）会被丢弃"
+            git reset --hard FETCH_HEAD
+            echo "merged=yes" >> "$GITHUB_OUTPUT"
+          else
+            if ! git merge --no-edit FETCH_HEAD; then
+              git merge --abort || true
+              {
+                echo "### 同步失败：存在冲突"
+                echo ""
+                echo "上游改动与 fork 本地改动冲突，需要在本地手动解决后推送。"
+                echo "```"
+                echo "git fetch upstream && git merge upstream/${{ steps.fetch.outputs.branch }}"
+                echo "```"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::与上游存在合并冲突，已中止本次同步"
+              exit 1
+            fi
+            echo "merged=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 推送
+        id: push
+        if: steps.merge.outputs.merged == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.fetch.outputs.branch }}"
+          git push origin "HEAD:${BRANCH}"
+          echo "after_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          NEW_VER="$(jq -r .version src-tauri/tauri.conf.json)"
+          echo "after_version=$NEW_VER" >> "$GITHUB_OUTPUT"
+          echo "已推送 ${BRANCH}：${{ steps.fetch.outputs.before_sha }} → $(git rev-parse --short HEAD)，版本 ${{ steps.fetch.outputs.before_version }} → $NEW_VER" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 决定是否触发打包
+        id: decide
+        if: steps.push.outputs.after_sha != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEN="${{ inputs.build_when || 'version' }}"
+          OLD="${{ steps.fetch.outputs.before_version }}"
+          NEW="${{ steps.push.outputs.after_version }}"
+          if [[ "$WHEN" == "never" ]]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          elif [[ "$WHEN" == "any" ]]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          elif [[ "$OLD" != "$NEW" ]]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "版本号变化 $OLD → $NEW，将触发打包。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "版本号仍为 $NEW，仅同步代码，不触发打包（想每次同步都打包时把 build_when 设为 any）。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 触发 macOS 打包
+        if: steps.decide.outputs.run == 'yes'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh workflow list --json path,name 2>/dev/null | grep -q "${BUILD_WORKFLOW}"; then
+            echo "::warning::未找到 ${BUILD_WORKFLOW}，跳过打包。请先把 build-macos-dmg.yml 放进 .github/workflows/"
+            exit 0
+          fi
+          gh workflow run "${BUILD_WORKFLOW}" \
+            --ref "${{ steps.fetch.outputs.branch }}" \
+            -f arch="${BUILD_ARCH}"
+          sleep 5
+          gh run list --workflow "${BUILD_WORKFLOW}" --limit 1 \
+            --json databaseId,status,url --template '{{range .}}打包任务已触发：{{.url}}{{"\n"}}{{end}}' \
+            >> "$GITHUB_STEP_SUMMARY" || true

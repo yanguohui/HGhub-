@@ -1,0 +1,144 @@
+name: Build macOS DMG
+
+# 在 GitHub 的 macOS runner 上编译 HGhub，产出 .dmg（不需要本机安装 Xcode）
+# 使用方法：把本文件放到仓库的 .github/workflows/build-macos-dmg.yml，然后
+#   - 在 fork / 自己的仓库里，Actions 页面手动 Run workflow；或
+#   - 推送到 main 分支自动触发。
+# 构建完成后在本次运行页面的 Artifacts 区下载 HGhub-macOS-<架构>。
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '打包架构'
+        type: choice
+        options: [universal, arm64, x64]
+        default: universal
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: macos-14
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: universal
+            target: universal-apple-darwin
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - arch: arm64
+            target: aarch64-apple-darwin
+            targets: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+            targets: x86_64-apple-darwin
+        # 手动触发时按输入筛选，push 触发时只打 universal
+        exclude: []
+
+    steps:
+      - name: 选择架构（手动触发时过滤 matrix）
+        id: pick
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            REQ="${{ inputs.arch }}"
+          else
+            REQ="universal"
+          fi
+          if [[ "$REQ" == "${{ matrix.arch }}" ]]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.pick.outputs.run == 'yes'
+
+      - name: 读取版本号
+        id: ver
+        if: steps.pick.outputs.run == 'yes'
+        shell: bash
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        if: steps.pick.outputs.run == 'yes'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: steps.pick.outputs.run == 'yes'
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.pick.outputs.run == 'yes'
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: swatinem/rust-cache@v2
+        if: steps.pick.outputs.run == 'yes'
+        with:
+          workspaces: src-tauri -> target
+          key: macos-${{ matrix.arch }}
+
+      - name: 安装前端依赖
+        if: steps.pick.outputs.run == 'yes'
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建 app + dmg（ad-hoc 签名，无需证书）
+        if: steps.pick.outputs.run == 'yes'
+        run: |
+          pnpm tauri build \
+            --config src-tauri/tauri.macos.conf.json \
+            --target ${{ matrix.target }} \
+            --bundles app dmg
+
+      - name: 整理产物并校验
+        if: steps.pick.outputs.run == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          A="${{ matrix.arch }}"
+          mkdir -p artifacts
+          DMG="$(find src-tauri/target/${{ matrix.target }} -name '*.dmg' | head -1)"
+          APP="$(find src-tauri/target/${{ matrix.target }} -name 'HGhub.app' -type d | head -1)"
+          [[ -n "$DMG" ]] || { echo "::error::未找到 DMG"; exit 1; }
+          [[ -n "$APP" ]] || { echo "::error::未找到 HGhub.app"; exit 1; }
+          cp "$DMG" "artifacts/HGhub_${V}_${A}.dmg"
+          tar -czf "artifacts/HGhub_${V}_${A}.app.tar.gz" -C "$(dirname "$APP")" HGhub.app
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -5 || true
+          codesign --verify --deep --strict "$APP" && echo "签名校验通过" || echo "::warning::签名校验未通过"
+          ( cd artifacts && shasum -a 256 *.dmg *.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        if: steps.pick.outputs.run == 'yes'
+        with:
+          name: HGhub-macOS-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: 汇总校验值到 Job Summary
+        if: steps.pick.outputs.run == 'yes'
+        shell: bash
+        run: |
+          {
+            echo "### HGhub macOS ${{ matrix.arch }} · v${{ steps.ver.outputs.version }}"
+            echo ''
+            echo '```'
+            cat artifacts/SHA256SUMS.txt
+            echo '```'
+            echo ''
+            echo '> 首次打开：右键 App → 打开；或 `sudo xattr -dr com.apple.quarantine /Applications/HGhub.app`'
+          } >> "$GITHUB_STEP_SUMMARY"
